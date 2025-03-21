@@ -114,7 +114,9 @@ Set the `DEBUG` environment variable to enable verbose logging:
 - [x] Resources for each file in workspace
 - [x] .gitignore support
 - [x] Change notifications
-- [ ] Optional support for line numbers
+- [ ] Standardize MCP protocol use to work with more clients (Claude Desktop)
+- [ ] Configurable support for line numbers
+- [ ] Resource update subscriptions
 - [ ] Additional ignore patterns (beyond `.gitignore`)
 - [ ] Debounced notifications for high-volume file changes
-- [ ] info, create, edit, and delete tools
+- [ ] `info`, `create`, `edit`, and `delete` tools
