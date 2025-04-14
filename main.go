@@ -60,9 +60,12 @@ func main() {
 		log.Printf("Starting MCP server for workspace: %s", absWorkspaceDir)
 	}
 
-	if err := mcpServer.Start(); err != nil {
-		log.Fatalf("Failed to start MCP server: %v", err)
-	}
+	// Start the server in a goroutine to allow for proper shutdown handling
+	go func() {
+		if err := mcpServer.Start(); err != nil {
+			log.Fatalf("Failed to start MCP server: %v", err)
+		}
+	}()
 
 	// Monitor parent process termination
 	// Claude desktop does not properly kill child processes for MCP servers

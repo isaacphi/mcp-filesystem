@@ -6,258 +6,257 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/isaacphi/mcp-filesystem/internal/gitignore"
+	"github.com/sabhiram/go-gitignore"
 )
 
-// Event types for file system changes
+// EventType represents the type of file event
+type EventType int
+
 const (
-	EventCreate int = iota
+	EventCreate EventType = iota
 	EventModify
 	EventDelete
 )
 
-// FileEvent represents a file system event
+// FileEvent represents a file event from the watcher
 type FileEvent struct {
 	Path      string
-	EventType int
+	EventType EventType
 }
 
-// FileWatcher watches a workspace for file changes
+// FileWatcher watches for file changes in a workspace
 type FileWatcher struct {
 	workspacePath string
-	matcher       *gitignore.Matcher
-	watcher       *fsnotify.Watcher
-	events        chan FileEvent
-	done          chan struct{}
-	watchedDirs   map[string]bool
-	mu            sync.RWMutex
+	fsWatcher     *fsnotify.Watcher
+	ignoreList    *ignore.GitIgnore
+	watchDirs     map[string]bool
 	debug         bool
+	stopped       bool
+	mu            sync.RWMutex
 }
 
 // NewFileWatcher creates a new file watcher
 func NewFileWatcher(workspacePath string, debug bool) (*FileWatcher, error) {
-	matcher, err := gitignore.NewMatcher(workspacePath)
+	fsWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create gitignore matcher: %v", err)
+		return nil, fmt.Errorf("failed to create fsnotify watcher: %v", err)
 	}
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create watcher: %v", err)
+	// Load gitignore if it exists
+	var ignoreList *ignore.GitIgnore
+	gitignorePath := filepath.Join(workspacePath, ".gitignore")
+	if _, err := os.Stat(gitignorePath); err == nil {
+		if debug {
+			log.Printf("Loading gitignore file: %s", gitignorePath)
+		}
+		ignoreList, err = ignore.CompileIgnoreFile(gitignorePath)
+		if err != nil {
+			log.Printf("Warning: Failed to compile gitignore file: %v", err)
+			// Continue without gitignore
+			ignoreList = ignore.CompileIgnoreLines()
+		}
+	} else {
+		// No gitignore file, create an empty one
+		ignoreList = ignore.CompileIgnoreLines()
 	}
 
 	return &FileWatcher{
 		workspacePath: workspacePath,
-		matcher:       matcher,
-		watcher:       watcher,
-		events:        make(chan FileEvent),
-		done:          make(chan struct{}),
-		watchedDirs:   make(map[string]bool),
+		fsWatcher:     fsWatcher,
+		ignoreList:    ignoreList,
+		watchDirs:     make(map[string]bool),
 		debug:         debug,
 	}, nil
 }
 
-// startWatching adds a directory to the watcher
-func (fw *FileWatcher) startWatching(path string) error {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
-
-	// Skip if already watched
-	if fw.watchedDirs[path] {
-		return nil
+// Start starts the file watcher
+func (w *FileWatcher) Start(ctx context.Context) (<-chan FileEvent, error) {
+	if err := w.addWorkspaceToWatcher(); err != nil {
+		return nil, fmt.Errorf("failed to add workspace to watcher: %v", err)
 	}
 
-	// Add to watcher
-	if err := fw.watcher.Add(path); err != nil {
-		return err
-	}
+	eventChan := make(chan FileEvent)
 
-	fw.watchedDirs[path] = true
-	if fw.debug {
-		log.Printf("Started watching: %s", path)
-	}
+	go func() {
+		defer close(eventChan)
+		defer w.fsWatcher.Close()
 
-	return nil
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-w.fsWatcher.Events:
+				if !ok {
+					return
+				}
+				w.handleFsEvent(event, eventChan)
+			case err, ok := <-w.fsWatcher.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("Watcher error: %v", err)
+			}
+		}
+	}()
+
+	return eventChan, nil
 }
 
-// stopWatching removes a directory from the watcher
-func (fw *FileWatcher) stopWatching(path string) {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+// Stop stops the file watcher
+func (w *FileWatcher) Stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	if fw.watchedDirs[path] {
-		_ = fw.watcher.Remove(path)
-		delete(fw.watchedDirs, path)
-		if fw.debug {
-			log.Printf("Stopped watching: %s", path)
+	if !w.stopped {
+		w.stopped = true
+		w.fsWatcher.Close()
+	}
+}
+
+// handleFsEvent processes a fsnotify event
+func (w *FileWatcher) handleFsEvent(event fsnotify.Event, eventChan chan<- FileEvent) {
+	// Skip temporary files and ignored files
+	if w.shouldIgnoreFile(event.Name) {
+		if w.debug {
+			log.Printf("Ignoring event for file: %s", event.Name)
+		}
+		return
+	}
+
+	// Handle directory creation
+	if event.Has(fsnotify.Create) {
+		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+			if w.debug {
+				log.Printf("Directory created: %s", event.Name)
+			}
+			// Add the new directory to the watcher
+			if err := w.addDirectoryToWatcher(event.Name); err != nil {
+				log.Printf("Failed to add directory to watcher: %v", err)
+			}
+			return
 		}
 	}
-}
 
-// Start begins watching the workspace for changes
-func (fw *FileWatcher) Start(ctx context.Context) (<-chan FileEvent, error) {
-	// Perform an initial scan of the workspace
-	if err := fw.scanWorkspace(); err != nil {
-		return nil, err
+	// Handle file events
+	var fileEventType EventType
+	switch {
+	case event.Has(fsnotify.Create):
+		fileEventType = EventCreate
+	case event.Has(fsnotify.Write) || event.Has(fsnotify.Chmod):
+		fileEventType = EventModify
+	case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
+		fileEventType = EventDelete
+	default:
+		// Unknown event type, ignore
+		return
 	}
 
-	// Start the event loop
-	go fw.eventLoop(ctx)
-
-	return fw.events, nil
-}
-
-// Stop stops watching for changes
-func (fw *FileWatcher) Stop() {
-	close(fw.done)
-	if err := fw.watcher.Close(); err != nil {
-		log.Printf("Error closing watcher: %v", err)
+	// Send event to the channel
+	fileEvent := FileEvent{
+		Path:      event.Name,
+		EventType: fileEventType,
 	}
+
+	if w.debug {
+		log.Printf("File event: %v %s", fileEventType, event.Name)
+	}
+
+	eventChan <- fileEvent
 }
 
-// scanWorkspace recursively adds all directories in the workspace to the watcher
-func (fw *FileWatcher) scanWorkspace() error {
-	return filepath.Walk(fw.workspacePath, func(path string, info os.FileInfo, err error) error {
+// GetInitialFiles returns a list of all files in the workspace
+func (w *FileWatcher) GetInitialFiles() ([]string, error) {
+	var files []string
+
+	err := filepath.Walk(w.workspacePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Skip ignored directories
-		if info.IsDir() {
-			if fw.matcher.ShouldIgnoreDir(path) {
-				if fw.debug {
-					log.Printf("Skipping ignored directory: %s", path)
-				}
-				return filepath.SkipDir
-			}
-
-			// Add directory to watcher
-			if err := fw.startWatching(path); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-}
-
-// eventLoop processes fsnotify events
-func (fw *FileWatcher) eventLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-fw.done:
-			return
-		case event, ok := <-fw.watcher.Events:
-			if !ok {
-				return
-			}
-			fw.handleFsEvent(event)
-		case err, ok := <-fw.watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("Error: %v", err)
-		}
-	}
-}
-
-// handleFsEvent processes a single fsnotify event
-func (fw *FileWatcher) handleFsEvent(event fsnotify.Event) {
-	// Check if this path should be ignored
-	if fw.matcher.ShouldIgnore(event.Name) {
-		return
-	}
-
-	if fw.debug {
-		log.Printf("Event: %s %s", event.Name, event.Op.String())
-	}
-
-	// Get file info
-	fileInfo, err := os.Stat(event.Name)
-	isDir := err == nil && fileInfo.IsDir()
-
-	// Handle directory events
-	if isDir {
-		if event.Op&fsnotify.Create != 0 {
-			// New directory - add to watcher
-			if err := fw.startWatching(event.Name); err != nil {
-				log.Printf("Error watching new directory: %v", err)
-				return
-			}
-
-			// Scan the new directory for sub-directories
-			_ = filepath.Walk(event.Name, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return nil
-				}
-				if info.IsDir() && path != event.Name {
-					if fw.matcher.ShouldIgnoreDir(path) {
-						return filepath.SkipDir
-					}
-					_ = fw.startWatching(path)
-				}
-				return nil
-			})
-		} else if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-			// Directory removed - remove from watcher
-			fw.stopWatching(event.Name)
-		}
-		return
-	}
-
-	// Handle file events
-	var eventType int
-	if event.Op&fsnotify.Create != 0 {
-		eventType = EventCreate
-	} else if event.Op&fsnotify.Write != 0 {
-		eventType = EventModify
-	} else if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		eventType = EventDelete
-	} else {
-		// Ignore other event types
-		return
-	}
-
-	// Send event to channel
-	select {
-	case fw.events <- FileEvent{Path: event.Name, EventType: eventType}:
-	case <-fw.done:
-		return
-	}
-}
-
-// GetInitialFiles returns a list of all existing files in the workspace
-func (fw *FileWatcher) GetInitialFiles() ([]string, error) {
-	var files []string
-
-	err := filepath.Walk(fw.workspacePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip files with errors
-		}
-
-		// Skip directories and ignored files
-		if info.IsDir() {
-			if fw.matcher.ShouldIgnoreDir(path) {
+		// Skip ignored files and directories
+		if w.shouldIgnoreFile(path) {
+			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if !fw.matcher.ShouldIgnore(path) {
-			files = append(files, path)
+		// Skip directories but add them to the watcher
+		if info.IsDir() {
+			if err := w.addDirectoryToWatcher(path); err != nil {
+				log.Printf("Failed to add directory to watcher: %v", err)
+			}
+			return nil
 		}
 
+		// Add file to the list
+		files = append(files, path)
 		return nil
 	})
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to walk workspace: %v", err)
 	}
 
 	return files, nil
+}
+
+// addWorkspaceToWatcher adds the workspace directory to the watcher
+func (w *FileWatcher) addWorkspaceToWatcher() error {
+	return w.addDirectoryToWatcher(w.workspacePath)
+}
+
+// addDirectoryToWatcher adds a directory to the watcher
+func (w *FileWatcher) addDirectoryToWatcher(dirPath string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Skip if already watching or if the directory is ignored
+	if w.watchDirs[dirPath] || w.shouldIgnoreFile(dirPath) {
+		return nil
+	}
+
+	// Add to the watcher
+	if err := w.fsWatcher.Add(dirPath); err != nil {
+		return fmt.Errorf("failed to add directory to watcher: %v", err)
+	}
+
+	w.watchDirs[dirPath] = true
+
+	if w.debug {
+		log.Printf("Added directory to watcher: %s", dirPath)
+	}
+
+	return nil
+}
+
+// shouldIgnoreFile checks if a file should be ignored
+func (w *FileWatcher) shouldIgnoreFile(path string) bool {
+	// Extract the relative path from the workspace
+	relPath, err := filepath.Rel(w.workspacePath, path)
+	if err != nil {
+		// If we can't get the relative path, ignore it
+		return true
+	}
+
+	// Convert Windows path separators to Unix for gitignore compatibility
+	relPath = strings.Replace(relPath, "\\", "/", -1)
+
+	// Check against gitignore
+	if w.ignoreList.MatchesPath(relPath) {
+		return true
+	}
+
+	// Check for hidden files (starting with .)
+	baseName := filepath.Base(path)
+	if strings.HasPrefix(baseName, ".") {
+		// But allow .gitignore itself
+		return baseName != ".gitignore"
+	}
+
+	return false
 }

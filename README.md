@@ -48,15 +48,15 @@ Your client will be able to access and reference all non-ignored files in your r
 
 Your client needs to support the following MCP features:
 
-Resource Listing: The ability to list and access resources exposed by the server
-Change Notifications: Support for receiving `notifications/resources/list_changed` events
-Resource Content Access: Ability to request and render resource content with appropriate MIME types
+- Resource Listing: The ability to list and access resources exposed by the server
+- Change Notifications: Support for receiving `notifications/resources/list_changed` events
+- Resource Content Access: Ability to request and render resource content with appropriate MIME types
 
 ## About
 
 This project uses:
 
-- [mcp-golang](https://github.com/metoro-io/mcp-golang) for MCP communication
+- [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) for MCP communication
 - [fsnotify](https://github.com/fsnotify/fsnotify) for file system event monitoring
 - [go-gitignore](https://github.com/sabhiram/go-gitignore) for parsing `.gitignore` files
 
